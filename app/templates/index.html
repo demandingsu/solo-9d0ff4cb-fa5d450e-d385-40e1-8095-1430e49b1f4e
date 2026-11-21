@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>航拍无云画幅合成</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <h1>航拍无云画幅合成</h1>
+    <span class="sub">按瓦片号去重取最新修订 · 云遮蔽像素透明 · 逐像素来源可追溯</span>
+  </header>
+
+  <main>
+    <div class="col">
+      {% if flash %}<div class="flash ok">{{ flash }}</div>{% endif %}
+      {% if flash_error %}<div class="flash err">{{ flash_error }}</div>{% endif %}
+      {% if state.error %}<div class="flash err">{{ state.error }}</div>{% endif %}
+
+      <section class="card">
+        <h2>画幅尺寸</h2>
+        <form method="post" action="/canvas">
+          <div class="grid2">
+            <label class="field"><span>宽度 (px)</span>
+              <input type="number" name="width" min="1" max="20000" required value="{{ state.width }}">
+            </label>
+            <label class="field"><span>高度 (px)</span>
+              <input type="number" name="height" min="1" max="20000" required value="{{ state.height }}">
+            </label>
+          </div>
+          <div class="actions">
+            <button type="submit" class="primary">更新画幅并重算</button>
+            <span class="small muted">画幅上限 20000×20000，总量 ≤ 1600 万像素（来源 CSV 按像素输出）。</span>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <h2>上传瓦片 <span class="hint">RGB PNG + 同尺寸二值云掩膜</span></h2>
+        <form method="post" action="/tiles" enctype="multipart/form-data">
+          <label class="field"><span>瓦片号</span>
+            <input type="text" name="tile_id" required maxlength="{{ limits.max_tile_id_len }}"
+                   pattern="[A-Za-z0-9][A-Za-z0-9_.\-]*" placeholder="例如 N37E127">
+          </label>
+          <div class="grid2">
+            <label class="field"><span>修订号</span>
+              <input type="number" name="revision" min="1" step="1" required value="1">
+            </label>
+            <label class="field"><span>位置 X / Y（左上角像素）</span>
+              <div class="grid2">
+                <input type="number" name="x" step="1" required value="0" aria-label="X">
+                <input type="number" name="y" step="1" required value="0" aria-label="Y">
+              </div>
+            </label>
+          </div>
+          <label class="field"><span>瓦片图像（RGB PNG）</span>
+            <input type="file" name="image" accept="image/png" required>
+          </label>
+          <label class="field"><span>云掩膜（同尺寸二值 PNG，非零 = 云）</span>
+            <input type="file" name="mask" accept="image/png" required>
+          </label>
+          <div class="actions">
+            <button type="submit" class="primary">提交瓦片</button>
+          </div>
+        </form>
+        <details>
+          <summary>合成规则</summary>
+          <ul class="rules">
+            <li>同一瓦片号只有 <b>最新修订号</b> 生效（修订号必须是正整数）。</li>
+            <li>重叠像素优先取 <b>无云</b> 的瓦片；都无云时取 <b>提交时间最新</b> 的瓦片。</li>
+            <li>云掩膜非零像素永远不会被当作颜色来源；没有无云来源的像素保持透明。</li>
+            <li>替换 = 提交同瓦片号的更高修订；撤回 = 让该修订失效，被覆盖的像素会从其余瓦片回填。</li>
+            <li>发布的 PNG 与来源 CSV 来自同一份冻结输入；发布期间改稿不会影响正在进行的本次发布。</li>
+          </ul>
+        </details>
+      </section>
+
+      <section class="card">
+        <h2>瓦片清单 <span class="hint">生效 {{ current|length }} 个</span></h2>
+        {% if tiles %}
+        <table>
+          <thead>
+            <tr>
+              <th>瓦片号</th><th class="num">修订</th><th class="num">X,Y</th>
+              <th class="num">尺寸</th><th class="num">云 / 总像素</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for t in active|sort(attribute='tile_id') %}
+            {% set is_current = t.id in current_ids %}
+            <tr class="{{ '' if is_current else 'inactive' }}">
+              <td class="mono">{{ t.tile_id }}</td>
+              <td class="num">r{{ t.revision }}</td>
+              <td class="num">{{ t.x }},{{ t.y }}</td>
+              <td class="num">{{ t.width }}×{{ t.height }}</td>
+              <td class="num">{{ t.cloud_pixels }} / {{ t.width * t.height }}</td>
+              <td class="num">
+                {% if is_current %}<span class="badge good">生效</span>{% else %}<span class="badge">已被更高修订取代</span>{% endif %}
+                <form method="post" action="/tiles/{{ t.id }}/withdraw" style="display:inline"
+                      onsubmit="return confirm('撤回瓦片 {{ t.tile_id }} 修订 r{{ t.revision }}？其覆盖的像素将由其余瓦片回填。');">
+                  <button type="submit" class="danger small" style="padding:2px 8px">撤回</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+          {% for t in withdrawn %}
+            <tr class="inactive">
+              <td class="mono">{{ t.tile_id }}</td>
+              <td class="num">r{{ t.revision }}</td>
+              <td class="num">{{ t.x }},{{ t.y }}</td>
+              <td class="num">{{ t.width }}×{{ t.height }}</td>
+              <td class="num">{{ t.cloud_pixels }} / {{ t.width * t.height }}</td>
+              <td class="num"><span class="badge bad">已撤回</span></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <p class="muted small">还没有瓦片。上传后会立即生成预览。</p>
+        {% endif %}
+      </section>
+    </div>
+
+    <div class="col">
+      <section class="card">
+        <h2>
+          当前预览
+          {% if state.version == state.state_version and not state.error %}
+            <span class="badge good">已是最新</span>
+          {% elif state.error %}
+            <span class="badge bad">生成失败</span>
+          {% else %}
+            <span class="badge warn">重算中</span>
+          {% endif %}
+          <span class="spacer"></span>
+          <span class="hint">{{ state.width }}×{{ state.height }}</span>
+        </h2>
+
+        <div class="preview-wrap">
+          {% if preview_ready %}
+            <img src="/preview.png?v={{ state.version }}" alt="无云画幅预览">
+          {% else %}
+            <div class="placeholder">
+              {% if state.error %}{{ state.error }}{% else %}预览尚未就绪{% endif %}
+            </div>
+          {% endif %}
+        </div>
+
+        <div class="stats">
+          <span>已覆盖像素 <b>{{ state.covered }}</b></span>
+          <span>透明像素 <b>{{ state.transparent }}</b></span>
+          <span>生效瓦片 <b>{{ current|length }}</b></span>
+          <span>输入指纹 <b class="mono">{{ fingerprint[:16] }}</b></span>
+        </div>
+
+        <div class="downloads">
+          {% if preview_ready %}
+          <a href="/preview.png?v={{ state.version }}">下载预览 PNG</a>
+          <a href="/preview.csv">下载预览来源 CSV</a>
+          {% endif %}
+          <form method="post" action="/publish" style="margin-left:auto">
+            <button type="submit" class="primary">发布当前预览</button>
+          </form>
+        </div>
+        <p class="small muted" style="margin:10px 0 0">
+          发布会把当前冻结输入渲染成 PNG + 来源 CSV，二者来自同一份输入快照。
+          发布期间继续上传或撤回不会影响本次结果；生成失败也不会产生半成品版本。
+        </p>
+      </section>
+
+      <section class="card">
+        <h2>已发布版本</h2>
+        {% if published %}
+          <div class="stats" style="margin-top:0">
+            <span>最新版本 <b>#{{ published.seq }}</b></span>
+            <span>发布于 <b>{{ published.created_at }}</b></span>
+            <span>尺寸 <b>{{ published.width }}×{{ published.height }}</b></span>
+            <span>瓦片 <b>{{ published.tile_count }}</b></span>
+            <span>覆盖 <b>{{ published.covered }}</b> / 透明 <b>{{ published.transparent }}</b></span>
+            {% if published.stale %}
+              <span class="badge warn">当前草稿已变化，最新版本仍可下载</span>
+            {% else %}
+              <span class="badge good">与当前输入一致</span>
+            {% endif %}
+          </div>
+          <div class="downloads">
+            <a href="/download/{{ published.id }}/mosaic.png">下载 mosaic.png</a>
+            <a href="/download/{{ published.id }}/sources.csv">下载 sources.csv</a>
+            <a href="/download/{{ published.id }}/manifest.json">查看清单 manifest.json</a>
+          </div>
+          <p class="small muted" style="margin:10px 0 0">
+            指纹 <span class="mono wrap-any">{{ published.fingerprint }}</span><br>
+            下载时校验 SHA-256，文件不完整或不一致会返回 503，绝不会给出半成品。
+          </p>
+        {% else %}
+          <p class="muted small">尚未发布任何版本。当前预览满足要求后点击“发布当前预览”。</p>
+        {% endif %}
+
+        {% if recent_versions %}
+        <details>
+          <summary>历史版本（最近 {{ recent_versions|length }} 个）</summary>
+          <table>
+            <thead><tr><th>#</th><th>时间</th><th class="num">尺寸</th><th class="num">瓦片</th><th>下载</th></tr></thead>
+            <tbody>
+            {% for v in recent_versions %}
+              <tr>
+                <td>{{ v.seq }}</td>
+                <td class="small muted">{{ v.created_at }}</td>
+                <td class="num">{{ v.width }}×{{ v.height }}</td>
+                <td class="num">{{ v.tile_count }}</td>
+                <td class="small">
+                  <a href="/download/{{ v.id }}/mosaic.png">PNG</a> ·
+                  <a href="/download/{{ v.id }}/sources.csv">CSV</a>
+                </td>
+              </tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </details>
+        {% endif %}
+      </section>
+    </div>
+  </main>
+</body>
+</html>

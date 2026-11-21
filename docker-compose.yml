@@ -1,0 +1,19 @@
+services:
+  mosaic:
+    build: .
+    image: aerial-mosaic:local
+    ports:
+      - "8000:8000"
+    environment:
+      MOSAIC_DATA_DIR: /data
+    volumes:
+      - mosaic-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mosaic-data:
