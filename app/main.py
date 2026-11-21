@@ -44,6 +44,16 @@ PNG_NAME = "mosaic.png"
 CSV_NAME = "sources.csv"
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_TILE_PIXELS = 50_000_000
+HASH_CHUNK_BYTES = 4 * 1024 * 1024
+
+
+def sha256_file(path: Path) -> str:
+    """Hash a file in bounded chunks (published CSVs can be hundreds of MB)."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -528,8 +538,8 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
                 width, height, current, runtime.storage_dir,
                 staging / PNG_NAME, staging / CSV_NAME,
             )
-            png_sha = hashlib.sha256((staging / PNG_NAME).read_bytes()).hexdigest()
-            csv_sha = hashlib.sha256((staging / CSV_NAME).read_bytes()).hexdigest()
+            png_sha = sha256_file(staging / PNG_NAME)
+            csv_sha = sha256_file(staging / CSV_NAME)
             (staging / "manifest.json").write_text(
                 _manifest_json(
                     version_id,
@@ -696,18 +706,16 @@ def create_app(data_dir: str | os.PathLike[str] | None = None) -> FastAPI:
             or path.parent.parent != runtime.versions_dir.resolve()
         ):
             raise HTTPException(status_code=503, detail="该版本文件不完整。")
-        data = path.read_bytes()
         expected = row["png_sha256"] if column == "png_rel" else row["csv_sha256"]
-        if hashlib.sha256(data).hexdigest() != expected:
+        if sha256_file(path) != expected:
             raise HTTPException(status_code=503, detail="该版本校验失败。")
-        from fastapi.responses import Response
-
-        return Response(
-            content=data,
+        # Stream the file (published CSVs can be hundreds of MB) instead of
+        # buffering it whole in memory.
+        return FileResponse(
+            path,
             media_type=media_type,
+            filename=filename,
             headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "Content-Length": str(len(data)),
                 "Cache-Control": "no-store",
                 "X-Mosaic-Version": f"{row['seq']}",
                 "X-Mosaic-Sha256": expected,

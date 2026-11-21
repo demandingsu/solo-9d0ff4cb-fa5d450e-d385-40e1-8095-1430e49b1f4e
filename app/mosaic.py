@@ -234,21 +234,6 @@ def compute_fingerprint(
 
 
 @dataclass
-class _Crop:
-    tile: TileRecord
-    x0: int
-    y0: int
-    x1: int
-    y1: int
-    rank: int
-    clear: bool = False
-
-    @property
-    def placement(self) -> tuple[int, int]:
-        return (self.x0 - self.tile.x, self.y0 - self.tile.y)
-
-
-@dataclass
 class RenderStats:
     width: int
     height: int
@@ -256,12 +241,15 @@ class RenderStats:
     transparent_pixels: int
 
 
-def _flat_pixels(image: Image.Image):
-    """Pillow 13 renamed getdata(); support both old and new releases."""
-    getter = getattr(image, "get_flattened_data", None)
-    if getter is not None:
-        return getter()
-    return image.getdata()
+def _decode_png_file(path: Path, mode: str) -> Image.Image:
+    """Decode one PNG fully into memory in the wanted mode.
+
+    The file handle is closed before returning, so the decoded buffer is the
+    only allocation kept by the caller.
+    """
+    with Image.open(path) as raw:
+        raw.load()
+        return raw if raw.mode == mode else raw.convert(mode)
 
 
 def render_mosaic(
@@ -278,102 +266,116 @@ def render_mosaic(
     submitted tile (by submission timestamp, not revision number) wins, as
     long as it has a cloud-free value there; otherwise the earlier tiles act
     as fallbacks.  Pixels with no clear source stay transparent.
+
+    The pipeline is deliberately memory-frugal so that a full-size canvas
+    (1600 万像素) composited from multi-megapixel tiles fits in a few hundred
+    MiB: tiles are pasted straight from their decoded buffers (Pillow clips
+    the off-canvas part, so no crop copies are made), the owner map uses the
+    narrowest pixel mode that can hold the tile ranks, and the CSV is
+    streamed row by row instead of building per-pixel Python lists.
     """
     validate_canvas(canvas_width, canvas_height)
 
-    # Newest first: index 0 has the highest priority.
+    # Newest first: index 0 has the highest priority.  Tiles falling fully
+    # outside the canvas are dropped; the survivors are re-ranked compactly
+    # (still newest first) so the owner map below stays as narrow as possible.
     ordered = sorted(tiles, key=lambda t: t.sort_key, reverse=True)
-    crops: list[_Crop] = []
-    for rank, tile in enumerate(ordered):
-        x0 = max(tile.x, 0)
-        y0 = max(tile.y, 0)
-        x1 = min(tile.x + tile.width, canvas_width)
-        y1 = min(tile.y + tile.height, canvas_height)
-        if x1 <= x0 or y1 <= y0:
-            continue
-        crops.append(_Crop(tile=tile, x0=x0, y0=y0, x1=x1, y1=y1, rank=rank))
+    ranked: list[tuple[int, TileRecord]] = []
+    for tile in ordered:
+        if (
+            max(tile.x, 0) < min(tile.x + tile.width, canvas_width)
+            and max(tile.y, 0) < min(tile.y + tile.height, canvas_height)
+        ):
+            ranked.append((len(ranked), tile))
+
+    # The owner map records which tile (rank + 1) supplied each pixel; 0 means
+    # "no source".  Pick the narrowest mode that can hold the ranks so the map
+    # costs 1/2/4 bytes per pixel instead of always 4.  `owner_cast` is the
+    # memoryview format matching the mode's tobytes() layout.
+    if len(ranked) <= 255:
+        owner_mode, owner_cast = "L", "B"
+    elif len(ranked) <= 65535:
+        owner_mode, owner_cast = "I;16", "H"
+    else:
+        owner_mode, owner_cast = "I", "I"
 
     canvas = Image.new("RGB", (canvas_width, canvas_height), (0, 0, 0))
     alpha = Image.new("L", (canvas_width, canvas_height), 0)
-    owner = Image.new("I", (canvas_width, canvas_height), 0xFFFFFFFF)
-    sentinel = 0xFFFFFFFF
+    owner = Image.new(owner_mode, (canvas_width, canvas_height), 0)
 
-    # Apply oldest first so newer tiles paint over them.
-    for crop in reversed(crops):
-        tile_path = storage_root / crop.tile.image_rel
-        mask_path = storage_root / crop.tile.mask_rel
-        with Image.open(tile_path) as image, Image.open(mask_path) as mask:
-            image = image.convert("RGB")
-            mask = mask.convert("L")
-            if image.size != (crop.tile.width, crop.tile.height):
-                raise RuntimeError(
-                    f"瓦片 {crop.tile.tile_id} r{crop.tile.revision} 文件尺寸已变化。"
-                )
-            left, top = crop.placement
-            box = (left, top, left + (crop.x1 - crop.x0), top + (crop.y1 - crop.y0))
-            image_crop = image.crop(box)
-            mask_crop = mask.crop(box)
-        clear_mask = mask_crop.point(lambda v: 255 if v == 0 else 0)
-        mask_pixels = list(_flat_pixels(clear_mask))
-        if not any(mask_pixels):
-            continue
-        crop.clear = True
-        canvas.paste(image_crop, (crop.x0, crop.y0), clear_mask)
-        alpha.paste(255, (crop.x0, crop.y0), clear_mask)
-        # Stream the owner map row by row (rank + 1, so 0 stays "no source").
-        crop_width = crop.x1 - crop.x0
-        overlay = Image.new("I", (crop_width, crop.y1 - crop.y0), 0)
-        overlay_rows = []
-        for start in range(0, len(mask_pixels), crop_width):
-            overlay_rows.extend(
-                crop.rank + 1 if value else 0
-                for value in mask_pixels[start:start + crop_width]
+    used_ranks: set[int] = set()
+
+    # Apply oldest first so newer tiles paint over them.  The mask is decoded
+    # before the (much larger) image so fully cloudy tiles never pay for the
+    # image decode, and so the mask buffer is freed before the image loads.
+    for rank, tile in reversed(ranked):
+        expected_size = (tile.width, tile.height)
+        mask = _decode_png_file(storage_root / tile.mask_rel, "L")
+        if mask.size != expected_size:
+            raise RuntimeError(
+                f"瓦片 {tile.tile_id} r{tile.revision} 文件尺寸已变化。"
             )
-        overlay.putdata(overlay_rows)
-        owner.paste(overlay, (crop.x0, crop.y0), clear_mask)
-
-    rgba = canvas.convert("RGBA")
-    rgba.putalpha(alpha)
-    rgba.save(png_path, format="PNG")
-
-    rank_to_tile = {crop.rank: crop.tile for crop in crops if crop.clear}
-    alphas = _flat_pixels(alpha)
-    covered = 0
-    label_for_rank = {
-        rank: (
-            quote_field(tile.tile_id),
-            str(tile.revision),
-        )
-        for rank, tile in rank_to_tile.items()
-    }
-    blank = ("", "")
-    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
-        handle.write("x,y,tile_id,revision\n")
-        rows = []
-        y = 0
-        x = 0
-        owners = _flat_pixels(owner)
-        for index, (rank_marker, opacity) in enumerate(zip(owners, alphas)):
-            if opacity == 0 or rank_marker == sentinel:
-                label = blank
-            else:
-                covered += 1
-                label = label_for_rank.get(rank_marker - 1, blank)
-            rows.append(f"{x},{y},{label[0]},{label[1]}")
-            x += 1
-            if x == canvas_width:
-                x = 0
-                y += 1
-            if len(rows) >= 20000:
-                handle.write("\n".join(rows) + "\n")
-                rows.clear()
-        if rows:
-            handle.write("\n".join(rows) + "\n")
+        # 255 where the tile is cloud-free, 0 where it is cloudy.
+        clear_mask = mask.point(lambda v: 255 if v == 0 else 0)
+        del mask
+        if clear_mask.getextrema()[1] == 0:
+            del clear_mask
+            continue  # fully cloudy tile contributes nothing
+        image = _decode_png_file(storage_root / tile.image_rel, "RGB")
+        if image.size != expected_size:
+            raise RuntimeError(
+                f"瓦片 {tile.tile_id} r{tile.revision} 文件尺寸已变化。"
+            )
+        used_ranks.add(rank)
+        # Paste at the tile's canvas position; Pillow clips the off-canvas
+        # part, so no cropped copies of the tile are needed.
+        position = (tile.x, tile.y)
+        canvas.paste(image, position, clear_mask)
+        alpha.paste(255, position, clear_mask)
+        owner.paste(rank + 1, position, clear_mask)
+        del image, clear_mask
 
     total = canvas_width * canvas_height
+    transparent = alpha.histogram()[0]
+    covered = total - transparent
+
+    rgba = canvas.convert("RGBA")
+    del canvas
+    rgba.putalpha(alpha)
+    del alpha
+    rgba.save(png_path, format="PNG")
+    del rgba
+
+    # Per-pixel provenance CSV (one line per pixel, top-to-bottom then
+    # left-to-right), streamed one canvas row at a time.  `suffix[0]` (no
+    # source) renders as two empty fields, exactly like the labelled entries.
+    suffix = [",,"] * (len(ranked) + 1)
+    for rank, tile in ranked:
+        if rank in used_ranks:
+            suffix[rank + 1] = f",{quote_field(tile.tile_id)},{tile.revision}"
+    owners: bytes | memoryview = owner.tobytes()
+    del owner
+    if owner_cast != "B":
+        owners = memoryview(owners).cast(owner_cast)
+    x_parts = [f"{x}," for x in range(canvas_width)]
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        handle.write("x,y,tile_id,revision\n")
+        write = handle.write
+        index = 0
+        for y in range(canvas_height):
+            ys = str(y)
+            prefixes = [x_part + ys for x_part in x_parts]
+            lines: list[str] = []
+            append = lines.append
+            for x in range(canvas_width):
+                append(prefixes[x] + suffix[owners[index]])
+                index += 1
+            write("\n".join(lines))
+            write("\n")
+
     return RenderStats(
         width=canvas_width,
         height=canvas_height,
         covered_pixels=covered,
-        transparent_pixels=total - covered,
+        transparent_pixels=transparent,
     )

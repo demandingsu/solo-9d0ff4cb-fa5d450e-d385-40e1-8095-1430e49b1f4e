@@ -6,6 +6,11 @@ services:
       - "8000:8000"
     environment:
       MOSAIC_DATA_DIR: /data
+    # 进程地址空间限额 384 MiB（合成管线已按此预算优化）。
+    ulimits:
+      as:
+        soft: 402653184
+        hard: 402653184
     volumes:
       - mosaic-data:/data
     restart: unless-stopped

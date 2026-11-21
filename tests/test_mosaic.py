@@ -147,6 +147,51 @@ def test_partially_offscreen_tile_is_clipped(tmp_path):
     assert Image.open(png_path).convert("RGBA").getpixel((0, 0))[:3] == (9, 9, 9)
 
 
+def test_fully_offscreen_tile_does_not_shift_owner_ranks(tmp_path):
+    storage = tmp_path / "tiles"
+    on_rel = _write_tile(storage, "on", (1, 2, 3), 2, 2, set())
+    off_rel = _write_tile(storage, "off", (9, 9, 9), 2, 2, set())
+    on = _record(1, "ON", 1, 0, 0, 2, 2, *on_rel, "2026-01-01T00:00:00+00:00")
+    # Newest tile lies fully outside the canvas; it must not appear in the
+    # output nor corrupt the rank bookkeeping of the visible tile.
+    off = _record(2, "OFF", 1, 50, 50, 2, 2, *off_rel, "2026-01-02T00:00:00+00:00")
+    png_path = tmp_path / "out.png"
+    csv_path = tmp_path / "out.csv"
+    stats = render_mosaic(2, 2, [on, off], storage, png_path, csv_path)
+    assert stats.covered_pixels == 4
+    assert Image.open(png_path).convert("RGBA").getpixel((1, 1))[:3] == (1, 2, 3)
+    rows = csv_path.read_text(encoding="utf-8").splitlines()
+    assert "0,0,ON,1" in rows
+    assert not any("OFF" in row for row in rows)
+
+
+def test_more_than_255_tiles_still_track_sources(tmp_path):
+    storage = tmp_path / "tiles"
+    records = []
+    # 260 tiles on one 2x2 canvas.  The 256 newest submissions are fully
+    # cloudy, so the winning tile has rank 256 and the owner map must hold
+    # values beyond one byte.
+    for i in range(260):
+        cloudy = i >= 4
+        colour = (i % 256, 255 - i % 256, 7)
+        cloud = {(0, 0), (1, 0), (0, 1), (1, 1)} if cloudy else set()
+        rel = _write_tile(storage, f"t{i}", colour, 2, 2, cloud)
+        records.append(
+            _record(
+                i + 1, f"T{i}", 1, 0, 0, 2, 2, *rel,
+                f"2026-01-01T{i // 3600:02d}:{(i // 60) % 60:02d}:{i % 60:02d}+00:00",
+            )
+        )
+    png_path = tmp_path / "out.png"
+    csv_path = tmp_path / "out.csv"
+    stats = render_mosaic(2, 2, records, storage, png_path, csv_path)
+    assert stats.covered_pixels == 4
+    # The newest clear tile is T3 (submitted 4th; everything newer is cloudy).
+    assert Image.open(png_path).convert("RGBA").getpixel((0, 0))[:3] == (3, 252, 7)
+    rows = csv_path.read_text(encoding="utf-8").splitlines()
+    assert rows[1:] == ["0,0,T3,1", "1,0,T3,1", "0,1,T3,1", "1,1,T3,1"]
+
+
 # --------------------------------------------------------------------------- #
 # End-to-end through the web app
 # --------------------------------------------------------------------------- #
